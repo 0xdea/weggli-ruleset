@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use nonempty::NonEmpty;
 use regex::Regex;
 use rustc_hash::{FxHashMap, FxHashSet};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use walkdir::WalkDir;
 use weggli::query::QueryTree;
@@ -23,8 +23,8 @@ pub enum RuleError {
     ParseFile(PathBuf, anyhow::Error),
     #[error("rule has no checks")]
     NoChecks,
-    #[error("rule has no name")]
-    NoName,
+    #[error("rule has no identifier")]
+    NoId,
     #[error("rule has multiple checks with the same name")]
     MultipleChecksWithSameName,
     #[error(transparent)]
@@ -118,11 +118,26 @@ impl RuleSet {
     }
 }
 
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Deserialize, Serialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Severity {
+    #[default]
+    None,
+    Low,
+    Medium,
+    High,
+    Critical,
+}
+
 pub struct Rule {
-    name: String,
+    id: String,
+    author: String,
     description: String,
+    severity: Severity,
     tags: FxHashSet<String>,
-    checkers: Vec<Checker>,
+    checks: Vec<Checker>,
 }
 
 impl Rule {
@@ -137,8 +152,16 @@ impl Rule {
         serde_yaml::from_str(rule.as_ref()).map_err(RuleError::from)
     }
 
-    pub fn name(&self) -> &str {
-        &self.name
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub fn author(&self) -> Option<&str> {
+        if self.author.is_empty() {
+            None
+        } else {
+            Some(&self.author)
+        }
     }
 
     pub fn description(&self) -> Option<&str> {
@@ -149,6 +172,10 @@ impl Rule {
         }
     }
 
+    pub fn severity(&self) -> Severity {
+        self.severity
+    }
+
     pub fn tags(&self) -> impl ExactSizeIterator<Item = &str> {
         self.tags.iter().map(String::as_str)
     }
@@ -157,8 +184,8 @@ impl Rule {
         self.tags.contains(tag.borrow())
     }
 
-    pub fn checkers(&self) -> &[Checker] {
-        &self.checkers
+    pub fn checks(&self) -> &[Checker] {
+        &self.checks
     }
 }
 
@@ -169,31 +196,42 @@ impl<'de> Deserialize<'de> for Rule {
     {
         #[derive(Deserialize)]
         struct RuleT {
-            name: String,
+            id: String,
+            #[serde(default)]
+            author: String,
             #[serde(default)]
             description: String,
             #[serde(default)]
+            severity: Severity,
+            #[serde(default)]
             tags: FxHashSet<String>,
-            #[serde(alias = "checker")]
-            checkers: OneOrMany<CheckerT>,
+            #[serde(
+                rename = "check patterns",
+                alias = "check-patterns",
+                alias = "check pattern",
+                alias = "check-pattern"
+            )]
+            checks: OneOrMany<CheckerT>,
         }
 
         let rule = RuleT::deserialize(deserializer)?;
 
-        if rule.name.is_empty() {
-            return Err(<D::Error as serde::de::Error>::custom(RuleError::NoName));
+        if rule.id.is_empty() {
+            return Err(<D::Error as serde::de::Error>::custom(RuleError::NoId));
         }
 
-        let checkers = rule
-            .checkers
+        let checks = rule
+            .checks
             .try_into()
             .map_err(<D::Error as serde::de::Error>::custom)?;
 
         Ok(Rule {
-            name: rule.name,
+            id: rule.id,
+            author: rule.author,
             description: rule.description,
+            severity: rule.severity,
             tags: rule.tags,
-            checkers,
+            checks,
         })
     }
 }
@@ -405,8 +443,14 @@ pattern: '{$func();}'
         let rule_with_many = r#"
 name: gets
 patterns:
-- $func();
-- '$func();'
+- |
+  {
+    $func();
+  }
+- |-
+  {
+    $func();
+  }
     "#;
 
         let r = serde_yaml::from_str::<Checker>(&rule_with_many)?;
@@ -418,36 +462,42 @@ patterns:
     #[test]
     fn test_rule_parse() -> Result<(), RuleError> {
         let rule1 = r#"
-name: call to unbounded copy functions
-checker:
-  name: gets
+id: call-to-unbounded-copy-functions
+check pattern:
   regex: func=^gets$
   pattern: '{$func();}'
 "#;
         let rule = Rule::from_str(rule1)?;
 
-        assert_eq!(rule.name(), "call to unbounded copy functions");
-        assert_eq!(rule.checkers().len(), 1);
+        assert_eq!(rule.id(), "call-to-unbounded-copy-functions");
+        assert_eq!(rule.checks().len(), 1);
 
         let rule2 = r#"
-name: call to unbounded copy functions
+id: call-to-unbounded-copy-functions
+description: call to unbounded copy functions
+severity: medium
 tags:
 - CWE-120
 - CWE-242
 - CWE-676
-checkers:
+check-patterns:
 - name: gets
   regex: func=^gets$
-  pattern: '{$func();}'
+  pattern: |
+    { $func(); }
+
 - name: st(r|p)(cpy|cat)
   regex: func=st(r|p)(cpy|cat)$
   pattern: '{$func();}'
+
 - name: wc(r|p)(cpy|cat)
   regex: func=wc(r|p)(cpy|cat)$
   pattern: '{$func();}'
+
 - name: sprintf
   regex: func=sprintf$
   pattern: '{$func();}'
+
 - name: scanf
   regex: func=scanf$
   pattern: '{$func();}'
@@ -455,8 +505,8 @@ checkers:
 
         let rule = Rule::from_str(rule2)?;
 
-        assert_eq!(rule.name(), "call to unbounded copy functions");
-        assert_eq!(rule.checkers().len(), 5);
+        assert_eq!(rule.id(), "call-to-unbounded-copy-functions");
+        assert_eq!(rule.checks().len(), 5);
 
         Ok(())
     }
