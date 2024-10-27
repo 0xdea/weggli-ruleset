@@ -1,0 +1,463 @@
+use std::borrow::Borrow;
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::BufReader;
+use std::path::{Path, PathBuf};
+
+use nonempty::NonEmpty;
+use regex::Regex;
+use rustc_hash::{FxHashMap, FxHashSet};
+use serde::Deserialize;
+use thiserror::Error;
+use walkdir::WalkDir;
+use weggli::query::QueryTree;
+use weggli::RegexMap;
+
+#[derive(Debug, Error)]
+pub enum RuleError {
+    #[error(transparent)]
+    Check(#[from] CheckError),
+    #[error("cannot parse rule: {0}")]
+    Parse(#[from] serde_yaml::Error),
+    #[error("cannot parse rule file {}: {1}", _0.display())]
+    ParseFile(PathBuf, anyhow::Error),
+    #[error("rule has no checks")]
+    NoChecks,
+    #[error("rule has no name")]
+    NoName,
+    #[error("rule has multiple checks with the same name")]
+    MultipleChecksWithSameName,
+    #[error(transparent)]
+    Regex(#[from] RegexError),
+}
+
+#[derive(Debug, Error)]
+pub enum CheckError {
+    #[error("check has no name")]
+    NoCheckName,
+    #[error("check has no patterns")]
+    NoCheckPatterns,
+    #[error("regex constraint has an invalid query variable `{0}`")]
+    InvalidQueryVariable(String),
+    #[error("invalid pattern: {0}")]
+    Pattern(#[from] weggli::WeggliError),
+    #[error(transparent)]
+    Regex(#[from] RegexError),
+}
+
+#[derive(Debug, Error)]
+pub enum RegexError {
+    #[error("`{0}` is not in the format `var=regex`")]
+    InvalidFormat(String),
+    #[error("invalid regex: {0}")]
+    InvalidRegex(#[from] regex::Error),
+}
+
+pub struct RuleSet {
+    rules: FxHashMap<String, Rule>,
+}
+
+impl RuleSet {
+    pub fn from_directory(root: impl AsRef<Path>, ignore_errors: bool) -> Result<Self, RuleError> {
+        let walker = WalkDir::new(root);
+        let mut rules = FxHashMap::default();
+
+        for dirent in walker
+            .into_iter()
+            .filter_entry(|e| {
+                e.file_type().is_dir() || {
+                    matches!(e.path().extension(), Some(x) if
+                    ["yml", "yaml"].contains(&x.to_string_lossy().as_ref()))
+                }
+            })
+            .filter_map(Result::ok)
+        {
+            if dirent.file_type().is_dir() {
+                continue;
+            }
+
+            let path = dirent.path();
+            match Rule::from_file(path) {
+                Ok(rule) => {
+                    rules.insert(path.display().to_string(), rule);
+                }
+                Err(e) => {
+                    if !ignore_errors {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+
+        Ok(Self { rules })
+    }
+
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, RuleError> {
+        let path = path.as_ref();
+        Ok(Self {
+            rules: FxHashMap::from_iter([(path.display().to_string(), Rule::from_file(path)?)]),
+        })
+    }
+
+    pub fn from_str(rule: impl AsRef<str>) -> Result<Self, RuleError> {
+        Ok(Self {
+            rules: FxHashMap::from_iter([(String::from("default"), Rule::from_str(rule)?)]),
+        })
+    }
+
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &Rule)> {
+        self.rules.iter().map(|(p, r)| (p.as_str(), r))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rules.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.rules.len()
+    }
+}
+
+pub struct Rule {
+    name: String,
+    description: String,
+    tags: FxHashSet<String>,
+    checkers: Vec<Checker>,
+}
+
+impl Rule {
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Self, RuleError> {
+        let path = path.as_ref();
+        let file = File::open(path).map_err(|e| RuleError::ParseFile(path.to_owned(), e.into()))?;
+        serde_yaml::from_reader(BufReader::new(file))
+            .map_err(|e| RuleError::ParseFile(path.to_owned(), e.into()))
+    }
+
+    pub fn from_str(rule: impl AsRef<str>) -> Result<Self, RuleError> {
+        serde_yaml::from_str(rule.as_ref()).map_err(RuleError::from)
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn description(&self) -> Option<&str> {
+        if self.description.is_empty() {
+            None
+        } else {
+            Some(&self.description)
+        }
+    }
+
+    pub fn tags(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.tags.iter().map(String::as_str)
+    }
+
+    pub fn has_tag(&self, tag: impl Borrow<str>) -> bool {
+        self.tags.contains(tag.borrow())
+    }
+
+    pub fn checkers(&self) -> &[Checker] {
+        &self.checkers
+    }
+}
+
+impl<'de> Deserialize<'de> for Rule {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct RuleT {
+            name: String,
+            #[serde(default)]
+            description: String,
+            #[serde(default)]
+            tags: FxHashSet<String>,
+            #[serde(alias = "checker")]
+            checkers: OneOrMany<CheckerT>,
+        }
+
+        let rule = RuleT::deserialize(deserializer)?;
+
+        if rule.name.is_empty() {
+            return Err(<D::Error as serde::de::Error>::custom(RuleError::NoName));
+        }
+
+        let checkers = rule
+            .checkers
+            .try_into()
+            .map_err(<D::Error as serde::de::Error>::custom)?;
+
+        Ok(Rule {
+            name: rule.name,
+            description: rule.description,
+            tags: rule.tags,
+            checkers,
+        })
+    }
+}
+
+pub struct Checker {
+    name: String,
+    patterns: Vec<QueryTree>,
+    regexes: RegexMap,
+    unique: bool,
+}
+
+impl Checker {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn patterns(&self) -> &[QueryTree] {
+        &self.patterns
+    }
+
+    pub fn regexes(&self) -> &RegexMap {
+        &self.regexes
+    }
+
+    pub fn unique(&self) -> bool {
+        self.unique
+    }
+}
+
+impl<'de> Deserialize<'de> for Checker {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let checker = CheckerT::deserialize(deserializer)?
+            .try_into()
+            .map_err(<D::Error as serde::de::Error>::custom)?;
+
+        Ok(checker)
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum OneOrMany<T> {
+    Many(NonEmpty<T>),
+    One(T),
+}
+
+impl<T> From<OneOrMany<T>> for Vec<T> {
+    fn from(value: OneOrMany<T>) -> Self {
+        match value {
+            OneOrMany::One(v) => vec![v],
+            OneOrMany::Many(vs) => vs.into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct CheckerT {
+    #[serde(default = "default_check_name")]
+    name: String,
+    #[serde(alias = "pattern")]
+    patterns: OneOrMany<String>,
+    #[serde(alias = "regex", default)]
+    regexes: Option<OneOrMany<String>>,
+    #[serde(default)]
+    unique: bool,
+}
+
+fn default_check_name() -> String {
+    String::from("default")
+}
+
+fn validate_checker(checker: CheckerT) -> Result<CheckerT, CheckError> {
+    if checker.name.is_empty() {
+        return Err(CheckError::NoCheckName);
+    }
+
+    Ok(checker)
+}
+
+fn build_patterns(
+    inputs: Vec<String>,
+    constraints: &RegexMap,
+) -> Result<(Vec<QueryTree>, FxHashSet<String>), CheckError> {
+    let mut variables = FxHashSet::default();
+    let mut patterns = Vec::with_capacity(inputs.len());
+
+    for input in inputs {
+        let pattern =
+            weggli::parse_search_pattern(&input, false, false, Some(constraints.clone()))?;
+
+        variables.extend(pattern.variables());
+        patterns.push(pattern);
+    }
+
+    Ok((patterns, variables))
+}
+
+// NOTE: this is from weggli! maybe replace with nom + regex
+fn build_regex_mapping(regexes: Option<OneOrMany<String>>) -> Result<RegexMap, CheckError> {
+    let mut result = HashMap::new();
+
+    let Some(regexes) = regexes.map(Vec::from) else {
+        return Ok(RegexMap::new(result));
+    };
+
+    for r in regexes {
+        let mut s = r.splitn(2, '=');
+        let var = s
+            .next()
+            .ok_or_else(|| RegexError::InvalidFormat(r.to_owned()))?;
+
+        let raw_regex = s
+            .next()
+            .ok_or_else(|| RegexError::InvalidFormat(r.to_owned()))?;
+
+        let mut normalised_var = if var.starts_with('$') {
+            var.to_string()
+        } else {
+            "$".to_string() + var
+        };
+        let negative = normalised_var.ends_with('!');
+
+        if negative {
+            normalised_var.pop(); // remove !
+        }
+
+        let regex = Regex::new(raw_regex).map_err(RegexError::from)?;
+
+        result.insert(normalised_var, (negative, regex));
+    }
+
+    Ok(RegexMap::new(result))
+}
+
+impl TryFrom<CheckerT> for Checker {
+    type Error = CheckError;
+
+    fn try_from(c: CheckerT) -> Result<Self, Self::Error> {
+        let regexes = build_regex_mapping(c.regexes)?;
+        let (patterns, variables) = build_patterns(c.patterns.into(), &regexes)?;
+
+        for v in regexes.variables() {
+            if !variables.contains(v) {
+                return Err(CheckError::InvalidQueryVariable(v.to_owned()));
+            }
+        }
+
+        Ok(Self {
+            name: c.name,
+            patterns,
+            regexes,
+            unique: c.unique,
+        })
+    }
+}
+
+impl TryFrom<OneOrMany<CheckerT>> for Vec<Checker> {
+    type Error = RuleError;
+
+    fn try_from(value: OneOrMany<CheckerT>) -> Result<Self, Self::Error> {
+        match value {
+            OneOrMany::One(checker) => {
+                let checker = validate_checker(checker)?;
+                Ok(vec![checker.try_into()?])
+            }
+            OneOrMany::Many(checkers) => {
+                let mut names = FxHashSet::default();
+                let mut checks = Vec::new();
+
+                for checker in checkers {
+                    let checker = validate_checker(checker)?;
+
+                    if !names.insert(checker.name.to_owned()) {
+                        return Err(RuleError::MultipleChecksWithSameName);
+                    }
+
+                    checks.push(checker.try_into()?);
+                }
+
+                Ok(checks)
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+
+    #[test]
+    fn test_pattern_one_or_many() -> Result<(), Box<dyn std::error::Error>> {
+        let one = "one";
+        let list = "- one\n- two\n";
+
+        serde_yaml::from_str::<OneOrMany<String>>(one)?;
+        serde_yaml::from_str::<OneOrMany<String>>(list)?;
+
+        let rule_with_one = r#"
+name: gets
+pattern: '{$func();}'
+    "#;
+
+        let r = serde_yaml::from_str::<Checker>(&rule_with_one)?;
+        assert_eq!(r.patterns().len(), 1);
+
+        let rule_with_many = r#"
+name: gets
+patterns:
+- $func();
+- '$func();'
+    "#;
+
+        let r = serde_yaml::from_str::<Checker>(&rule_with_many)?;
+        assert_eq!(r.patterns().len(), 2);
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_rule_parse() -> Result<(), RuleError> {
+        let rule1 = r#"
+name: call to unbounded copy functions
+checker:
+  name: gets
+  regex: func=^gets$
+  pattern: '{$func();}'
+"#;
+        let rule = Rule::from_str(rule1)?;
+
+        assert_eq!(rule.name(), "call to unbounded copy functions");
+        assert_eq!(rule.checkers().len(), 1);
+
+        let rule2 = r#"
+name: call to unbounded copy functions
+tags:
+- CWE-120
+- CWE-242
+- CWE-676
+checkers:
+- name: gets
+  regex: func=^gets$
+  pattern: '{$func();}'
+- name: st(r|p)(cpy|cat)
+  regex: func=st(r|p)(cpy|cat)$
+  pattern: '{$func();}'
+- name: wc(r|p)(cpy|cat)
+  regex: func=wc(r|p)(cpy|cat)$
+  pattern: '{$func();}'
+- name: sprintf
+  regex: func=sprintf$
+  pattern: '{$func();}'
+- name: scanf
+  regex: func=scanf$
+  pattern: '{$func();}'
+"#;
+
+        let rule = Rule::from_str(rule2)?;
+
+        assert_eq!(rule.name(), "call to unbounded copy functions");
+        assert_eq!(rule.checkers().len(), 5);
+
+        Ok(())
+    }
+}
