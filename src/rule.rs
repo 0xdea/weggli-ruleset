@@ -1,16 +1,21 @@
 use std::borrow::Borrow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
+use std::iter::repeat;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use memchr::memmem;
 use nonempty::NonEmpty;
 use regex::Regex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
+use tree_sitter::Tree;
 use walkdir::WalkDir;
 use weggli::query::QueryTree;
+use weggli::result::QueryResult;
 use weggli::RegexMap;
 
 #[derive(Debug, Error)]
@@ -53,8 +58,9 @@ pub enum RegexError {
     InvalidRegex(#[from] regex::Error),
 }
 
+#[derive(Clone)]
 pub struct RuleSet {
-    rules: FxHashMap<String, Rule>,
+    rules: Arc<FxHashMap<String, Rule>>,
 }
 
 impl RuleSet {
@@ -89,24 +95,48 @@ impl RuleSet {
             }
         }
 
-        Ok(Self { rules })
+        Ok(Self {
+            rules: Arc::new(rules),
+        })
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, RuleError> {
         let path = path.as_ref();
         Ok(Self {
-            rules: FxHashMap::from_iter([(path.display().to_string(), Rule::from_file(path)?)]),
+            rules: Arc::new(FxHashMap::from_iter([(
+                path.display().to_string(),
+                Rule::from_file(path)?,
+            )])),
         })
     }
 
     pub fn from_str(rule: impl AsRef<str>) -> Result<Self, RuleError> {
         Ok(Self {
-            rules: FxHashMap::from_iter([(String::from("default"), Rule::from_str(rule)?)]),
+            rules: Arc::new(FxHashMap::from_iter([(
+                String::from("default"),
+                Rule::from_str(rule)?,
+            )])),
         })
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &Rule)> {
         self.rules.iter().map(|(p, r)| (p.as_str(), r))
+    }
+
+    pub fn viable_checkers(&self, source: impl AsRef<str>) -> Vec<(&Rule, &Checker)> {
+        let source = source.as_ref();
+
+        self.rules
+            .values()
+            .map(|rule| {
+                repeat(rule).zip(
+                    rule.checks()
+                        .iter()
+                        .filter(|checker| checker.can_match(source)),
+                )
+            })
+            .flatten()
+            .collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -236,10 +266,31 @@ impl<'de> Deserialize<'de> for Rule {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+pub enum CheckerLanguage {
+    #[serde(rename = "c", alias = "C++")]
+    #[default]
+    C,
+    #[serde(rename = "c++", alias = "C++")]
+    Cplusplus,
+}
+
+impl CheckerLanguage {
+    pub fn is_c(&self) -> bool {
+        matches!(self, Self::C)
+    }
+
+    pub fn is_cxx(&self) -> bool {
+        matches!(self, Self::Cplusplus)
+    }
+}
+
 pub struct Checker {
     name: String,
-    patterns: Vec<QueryTree>,
-    regexes: RegexMap,
+    language: CheckerLanguage,
+    pattern: QueryTree,
+    identifiers: Vec<String>,
+    limit: bool,
     unique: bool,
 }
 
@@ -248,16 +299,51 @@ impl Checker {
         &self.name
     }
 
-    pub fn patterns(&self) -> &[QueryTree] {
-        &self.patterns
+    pub fn language(&self) -> CheckerLanguage {
+        self.language
     }
 
-    pub fn regexes(&self) -> &RegexMap {
-        &self.regexes
+    pub fn pattern(&self) -> &QueryTree {
+        &self.pattern
+    }
+
+    pub fn limit(&self) -> bool {
+        self.limit
     }
 
     pub fn unique(&self) -> bool {
         self.unique
+    }
+
+    pub fn can_match(&self, source: &str) -> bool {
+        self.identifiers
+            .iter()
+            .all(|ident| memmem::find(source.as_ref(), ident.as_ref()).is_some())
+    }
+
+    pub fn check_match(&self, tree: &Tree, source: &str) -> Vec<QueryResult> {
+        let matches = self.pattern.matches(tree.root_node(), source);
+        if matches.is_empty() {
+            return Vec::with_capacity(0);
+        }
+
+        let check_unique = |m: &QueryResult| {
+            !self.unique || {
+                let mut seen = FxHashSet::default();
+                m.vars
+                    .keys()
+                    .filter_map(|k| m.value(k, &source))
+                    .all(|x| seen.insert(x))
+            }
+        };
+
+        let mut skip_set = FxHashSet::default();
+        let mut check_limit = |m: &QueryResult| !self.limit || skip_set.insert(m.start_offset());
+
+        matches
+            .into_iter()
+            .filter(|v| check_unique(v) && check_limit(v))
+            .collect()
     }
 }
 
@@ -294,10 +380,13 @@ impl<T> From<OneOrMany<T>> for Vec<T> {
 struct CheckerT {
     #[serde(default = "default_check_name")]
     name: String,
-    #[serde(alias = "pattern")]
-    patterns: OneOrMany<String>,
+    #[serde(default)]
+    language: CheckerLanguage,
+    pattern: String,
     #[serde(alias = "regex", default)]
     regexes: Option<OneOrMany<String>>,
+    #[serde(default)]
+    limit: bool,
     #[serde(default)]
     unique: bool,
 }
@@ -314,22 +403,15 @@ fn validate_checker(checker: CheckerT) -> Result<CheckerT, CheckError> {
     Ok(checker)
 }
 
-fn build_patterns(
-    inputs: Vec<String>,
+fn build_pattern(
+    input: String,
     constraints: &RegexMap,
-) -> Result<(Vec<QueryTree>, FxHashSet<String>), CheckError> {
-    let mut variables = FxHashSet::default();
-    let mut patterns = Vec::with_capacity(inputs.len());
+    cxx: bool,
+) -> Result<(QueryTree, HashSet<String>), CheckError> {
+    let pattern = weggli::parse_search_pattern(&input, cxx, false, Some(constraints.clone()))?;
+    let variables = pattern.variables();
 
-    for input in inputs {
-        let pattern =
-            weggli::parse_search_pattern(&input, false, false, Some(constraints.clone()))?;
-
-        variables.extend(pattern.variables());
-        patterns.push(pattern);
-    }
-
-    Ok((patterns, variables))
+    Ok((pattern, variables))
 }
 
 // NOTE: this is from weggli! maybe replace with nom + regex
@@ -341,20 +423,19 @@ fn build_regex_mapping(regexes: Option<OneOrMany<String>>) -> Result<RegexMap, C
     };
 
     for r in regexes {
-        let mut s = r.splitn(2, '=');
-        let var = s
-            .next()
+        let (var, raw_regex) = r
+            .split_once('=')
             .ok_or_else(|| RegexError::InvalidFormat(r.to_owned()))?;
 
-        let raw_regex = s
-            .next()
-            .ok_or_else(|| RegexError::InvalidFormat(r.to_owned()))?;
+        let var = var.trim();
+        let raw_regex = raw_regex.trim();
 
         let mut normalised_var = if var.starts_with('$') {
-            var.to_string()
+            var.to_owned()
         } else {
-            "$".to_string() + var
+            format!("${var}")
         };
+
         let negative = normalised_var.ends_with('!');
 
         if negative {
@@ -374,7 +455,7 @@ impl TryFrom<CheckerT> for Checker {
 
     fn try_from(c: CheckerT) -> Result<Self, Self::Error> {
         let regexes = build_regex_mapping(c.regexes)?;
-        let (patterns, variables) = build_patterns(c.patterns.into(), &regexes)?;
+        let (pattern, variables) = build_pattern(c.pattern.into(), &regexes, c.language.is_cxx())?;
 
         for v in regexes.variables() {
             if !variables.contains(v) {
@@ -384,8 +465,10 @@ impl TryFrom<CheckerT> for Checker {
 
         Ok(Self {
             name: c.name,
-            patterns,
-            regexes,
+            language: c.language,
+            identifiers: pattern.identifiers(),
+            pattern,
+            limit: c.limit,
             unique: c.unique,
         })
     }
@@ -423,41 +506,6 @@ impl TryFrom<OneOrMany<CheckerT>> for Vec<Checker> {
 #[cfg(test)]
 mod test {
     use super::*;
-
-    #[test]
-    fn test_pattern_one_or_many() -> Result<(), Box<dyn std::error::Error>> {
-        let one = "one";
-        let list = "- one\n- two\n";
-
-        serde_yaml::from_str::<OneOrMany<String>>(one)?;
-        serde_yaml::from_str::<OneOrMany<String>>(list)?;
-
-        let rule_with_one = r#"
-name: gets
-pattern: '{$func();}'
-    "#;
-
-        let r = serde_yaml::from_str::<Checker>(&rule_with_one)?;
-        assert_eq!(r.patterns().len(), 1);
-
-        let rule_with_many = r#"
-name: gets
-patterns:
-- |
-  {
-    $func();
-  }
-- |-
-  {
-    $func();
-  }
-    "#;
-
-        let r = serde_yaml::from_str::<Checker>(&rule_with_many)?;
-        assert_eq!(r.patterns().len(), 2);
-
-        Ok(())
-    }
 
     #[test]
     fn test_rule_parse() -> Result<(), RuleError> {

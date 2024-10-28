@@ -8,6 +8,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 nonempty = { version = "0.10", features = ["serialize"] }
+memchr = "2.7"
 regex = "1"
 rustc-hash = "2"
 serde = { version = "1", features = ["derive"] }
