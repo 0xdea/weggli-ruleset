@@ -37,3 +37,15 @@ check-patterns:
   pattern: |
     { $func(); }
 ```
+
+## Usage
+
+```rust
+use std::fs;
+use weggli_ruleset::RuleMatcher;
+
+let mut matcher = RuleMatcher::from_directory("rules")?;
+let source = fs::read_to_string("tests/test.c")?;
+
+let matches = matcher.matches(source)?;
+```

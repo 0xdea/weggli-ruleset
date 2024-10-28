@@ -2,7 +2,6 @@ use std::borrow::Borrow;
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::BufReader;
-use std::iter::repeat;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -60,7 +59,7 @@ pub enum RegexError {
 
 #[derive(Clone)]
 pub struct RuleSet {
-    rules: Arc<FxHashMap<String, Rule>>,
+    rules: Arc<FxHashMap<String, Arc<Rule>>>,
 }
 
 impl RuleSet {
@@ -85,7 +84,7 @@ impl RuleSet {
             let path = dirent.path();
             match Rule::from_file(path) {
                 Ok(rule) => {
-                    rules.insert(path.display().to_string(), rule);
+                    rules.insert(path.display().to_string(), Arc::new(rule));
                 }
                 Err(e) => {
                     if !ignore_errors {
@@ -105,7 +104,7 @@ impl RuleSet {
         Ok(Self {
             rules: Arc::new(FxHashMap::from_iter([(
                 path.display().to_string(),
-                Rule::from_file(path)?,
+                Arc::new(Rule::from_file(path)?),
             )])),
         })
     }
@@ -114,26 +113,28 @@ impl RuleSet {
         Ok(Self {
             rules: Arc::new(FxHashMap::from_iter([(
                 String::from("default"),
-                Rule::from_str(rule)?,
+                Arc::new(Rule::from_str(rule)?),
             )])),
         })
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &Rule)> {
-        self.rules.iter().map(|(p, r)| (p.as_str(), r))
+        self.rules.iter().map(|(p, r)| (p.as_str(), r.as_ref()))
     }
 
-    pub fn viable_checkers(&self, source: impl AsRef<str>) -> Vec<(&Rule, &Checker)> {
+    pub fn viable_checkers(&self, source: impl AsRef<str>) -> Vec<(Arc<Rule>, usize, &Checker)> {
         let source = source.as_ref();
 
         self.rules
             .values()
             .map(|rule| {
-                repeat(rule).zip(
-                    rule.checks()
-                        .iter()
-                        .filter(|checker| checker.can_match(source)),
-                )
+                rule.checks().iter().enumerate().filter_map(|(i, checker)| {
+                    if checker.can_match(source) {
+                        Some((rule.clone(), i, checker))
+                    } else {
+                        None
+                    }
+                })
             })
             .flatten()
             .collect()
@@ -167,7 +168,7 @@ pub struct Rule {
     description: String,
     severity: Severity,
     tags: FxHashSet<String>,
-    checks: Vec<Checker>,
+    checks: Box<[Checker]>,
 }
 
 impl Rule {
@@ -206,8 +207,8 @@ impl Rule {
         self.severity
     }
 
-    pub fn tags(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.tags.iter().map(String::as_str)
+    pub fn tags(&self) -> &FxHashSet<String> {
+        &self.tags
     }
 
     pub fn has_tag(&self, tag: impl Borrow<str>) -> bool {
@@ -250,10 +251,9 @@ impl<'de> Deserialize<'de> for Rule {
             return Err(<D::Error as serde::de::Error>::custom(RuleError::NoId));
         }
 
-        let checks = rule
-            .checks
-            .try_into()
-            .map_err(<D::Error as serde::de::Error>::custom)?;
+        let checks = Vec::try_from(rule.checks)
+            .map_err(<D::Error as serde::de::Error>::custom)?
+            .into_boxed_slice();
 
         Ok(Rule {
             id: rule.id,
@@ -286,10 +286,10 @@ impl CheckerLanguage {
 }
 
 pub struct Checker {
-    name: String,
+    name: Arc<str>,
     language: CheckerLanguage,
     pattern: QueryTree,
-    identifiers: Vec<String>,
+    identifiers: Box<[String]>,
     limit: bool,
     unique: bool,
 }
@@ -297,6 +297,10 @@ pub struct Checker {
 impl Checker {
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn name_for_match(&self) -> Arc<str> {
+        self.name.clone()
     }
 
     pub fn language(&self) -> CheckerLanguage {
@@ -464,9 +468,9 @@ impl TryFrom<CheckerT> for Checker {
         }
 
         Ok(Self {
-            name: c.name,
+            name: Arc::from(c.name),
             language: c.language,
-            identifiers: pattern.identifiers(),
+            identifiers: pattern.identifiers().into_boxed_slice(),
             pattern,
             limit: c.limit,
             unique: c.unique,
