@@ -1,3 +1,4 @@
+use std::fmt::Debug;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -29,7 +30,11 @@ impl RuleMatch {
         &self.rule().checks()[self.checker]
     }
 
-    pub fn source(&self) -> &str {
+    pub fn source(&self) -> Arc<str> {
+        self.source.clone()
+    }
+
+    pub fn source_ref(&self) -> &str {
         &self.source
     }
 
@@ -40,6 +45,26 @@ impl RuleMatch {
     pub fn display(&self, before: usize, after: usize, line_numbers: bool) -> String {
         self.result
             .display(&self.source, before, after, line_numbers)
+    }
+}
+
+impl Debug for RuleMatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut m = f.debug_struct("RuleMatch");
+
+        m.field("rule", &self.rule.id() as _);
+        m.field("checker", &self.checker().name() as _);
+
+        if let Some(ref description) = self.rule().description() {
+            m.field("description", description as _);
+        }
+
+        m.field("tags", self.rule().tags() as _);
+        m.field("severity", &self.rule().severity() as _);
+
+        m.field("match", &self.result as _);
+
+        m.finish_non_exhaustive()
     }
 }
 
@@ -130,5 +155,93 @@ impl RuleMatcher {
             .collect();
 
         Ok(results)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::RuleMatcher;
+
+    #[test]
+    fn test_strcpy() -> Result<(), Box<dyn std::error::Error>> {
+        let decompiler_output = r#"
+char *__fastcall sub_XYZ(char *s, size_t a2)
+{
+  char *v2; // rbx
+  char *v3; // rax
+  const char *v4; // r15
+  char *v5; // rax
+  const char *v6; // r15
+
+  v2 = s;
+  v3 = j__secure_getenv("ZZZ");
+  if ( !v3 || (v4 = v3, !*v3) )
+  {
+    v5 = j__secure_getenv("HOME");
+    if ( v5 )
+    {
+      v6 = v5;
+      if ( *v5 )
+      {
+        if ( strlen(v5) + 6 < a2 )
+        {
+          strcpy(s, v6);
+          *(_WORD *)&s[strlen(s)] = 47;
+          strcat(s, ".rnd");
+          return v2;
+        }
+      }
+    }
+    return 0LL;
+  }
+  if ( strlen(v3) + 1 >= a2 )
+    return 0LL;
+  strcpy(s, v4);
+  return v2;
+}
+"#;
+
+        let rule = r#"
+id: call-to-unbounded-copy-functions
+description: call to unbounded copy functions
+severity: medium
+tags:
+- CWE-120
+- CWE-242
+- CWE-676
+check-patterns:
+- name: gets
+  regex: func=^gets$
+  pattern: |
+    { $func(); }
+- name: st(r|p)(cpy|cat)
+  regex: func=st(r|p)(cpy|cat)$
+  pattern: |
+    { $func(); }
+- name: wc(r|p)(cpy|cat)
+  regex: func=wc(r|p)(cpy|cat)$
+  pattern: |
+    { $func(); }
+- name: sprintf
+  regex: func=sprintf$
+  pattern: |
+    { $func(); }
+- name: scanf
+  regex: func=scanf$
+  pattern: |
+    { $func(); }
+"#;
+
+        let mut matcher = RuleMatcher::from_str(rule)?;
+
+        let matches = matcher.matches_with(decompiler_output, false)?;
+
+        println!("{matches:#?}");
+
+        for m in matches {
+            println!("\n\n{}", m.display(5, 5, true));
+        }
+
+        Ok(())
     }
 }

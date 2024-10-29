@@ -1,8 +1,10 @@
 [package]
 name = "weggli-ruleset"
-description = "Ruleset managment for weggli patterns"
-authors = ["Sam L. Thomas <s@ghost.sh>"]
 version = "0.1.0"
+authors = ["Sam L. Thomas <s@ghost.sh>"]
+description = "Ruleset managment/matching/reporting for weggli patterns"
+license = "MIT"
+repository = "https://github.com/xorpse/weggli-ruleset.git"
 edition = "2021"
 
 [dependencies]
@@ -11,7 +13,7 @@ nonempty = { version = "0.10", features = ["serialize"] }
 memchr = "2.7"
 regex = "1"
 rustc-hash = "2"
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_yaml = { version = "0.0.12", package = "serde_yml" }
 thiserror = "1"
 tree-sitter = "0.24"
