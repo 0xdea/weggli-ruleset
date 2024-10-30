@@ -51,6 +51,10 @@ impl RuleMatch {
         &self.result
     }
 
+    pub fn into_result(self) -> QueryResult {
+        self.result
+    }
+
     pub fn display(&self, before: usize, after: usize, line_numbers: bool) -> String {
         self.result
             .display(&self.source, before, after, line_numbers)
