@@ -8,7 +8,7 @@ use std::sync::Arc;
 use memchr::memmem;
 use nonempty::NonEmpty;
 use regex::Regex;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tree_sitter::Tree;
@@ -59,13 +59,13 @@ pub enum RegexError {
 
 #[derive(Clone)]
 pub struct RuleSet {
-    rules: Arc<FxHashMap<String, Arc<Rule>>>,
+    rules: Arc<[(String, Arc<Rule>)]>,
 }
 
 impl RuleSet {
     pub fn from_directory(root: impl AsRef<Path>, ignore_errors: bool) -> Result<Self, RuleError> {
         let walker = WalkDir::new(root);
-        let mut rules = FxHashMap::default();
+        let mut rules = Vec::new();
 
         for dirent in walker
             .into_iter()
@@ -84,7 +84,7 @@ impl RuleSet {
             let path = dirent.path();
             match Rule::from_file(path) {
                 Ok(rule) => {
-                    rules.insert(path.display().to_string(), Arc::new(rule));
+                    rules.push((path.display().to_string(), Arc::new(rule)));
                 }
                 Err(e) => {
                     if !ignore_errors {
@@ -95,46 +95,57 @@ impl RuleSet {
         }
 
         Ok(Self {
-            rules: Arc::new(rules),
+            rules: Arc::from(rules),
         })
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, RuleError> {
         let path = path.as_ref();
         Ok(Self {
-            rules: Arc::new(FxHashMap::from_iter([(
+            rules: Arc::from(vec![(
                 path.display().to_string(),
                 Arc::new(Rule::from_file(path)?),
-            )])),
+            )]),
         })
     }
 
     pub fn from_str(rule: impl AsRef<str>) -> Result<Self, RuleError> {
         Ok(Self {
-            rules: Arc::new(FxHashMap::from_iter([(
+            rules: Arc::from(vec![(
                 String::from("default"),
                 Arc::new(Rule::from_str(rule)?),
-            )])),
+            )]),
         })
+    }
+
+    pub fn get(&self, index: usize) -> Option<Arc<Rule>> {
+        self.rules.get(index).map(|(_, r)| r.clone())
     }
 
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &Rule)> {
         self.rules.iter().map(|(p, r)| (p.as_str(), r.as_ref()))
     }
 
-    pub fn viable_checkers(&self, source: impl AsRef<str>) -> Vec<(Arc<Rule>, usize, &Checker)> {
+    pub fn viable_checkers(
+        &self,
+        source: impl AsRef<str>,
+    ) -> Vec<(usize, Arc<Rule>, usize, &Checker)> {
         let source = source.as_ref();
 
         self.rules
-            .values()
-            .map(|rule| {
-                rule.checks().iter().enumerate().filter_map(|(i, checker)| {
-                    if checker.can_match(source) {
-                        Some((rule.clone(), i, checker))
-                    } else {
-                        None
-                    }
-                })
+            .iter()
+            .enumerate()
+            .map(|(rule_id, (_, rule))| {
+                rule.checks()
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(i, checker)| {
+                        if checker.can_match(source) {
+                            Some((rule_id, rule.clone(), i, checker))
+                        } else {
+                            None
+                        }
+                    })
             })
             .flatten()
             .collect()

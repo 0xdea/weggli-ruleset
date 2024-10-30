@@ -16,7 +16,8 @@ pub struct RuleMatcher {
 
 pub struct RuleMatch {
     rule: Arc<Rule>,
-    checker: usize,
+    rule_id: usize,
+    checker_id: usize,
     source: Arc<str>,
     result: QueryResult,
 }
@@ -26,8 +27,16 @@ impl RuleMatch {
         &self.rule
     }
 
+    pub fn rule_id(&self) -> usize {
+        self.rule_id
+    }
+
+    pub fn checker_id(&self) -> usize {
+        self.rule_id
+    }
+
     pub fn checker(&self) -> &Checker {
-        &self.rule().checks()[self.checker]
+        &self.rule().checks()[self.checker_id]
     }
 
     pub fn source(&self) -> Arc<str> {
@@ -140,14 +149,15 @@ impl RuleMatcher {
 
         let results = checkers
             .into_iter()
-            .flat_map(|(rule, index, checker)| {
+            .flat_map(|(rule_id, rule, checker_id, checker)| {
                 let source = source.clone();
                 checker
                     .check_match(&tree, &source)
                     .into_iter()
                     .map(move |result| RuleMatch {
                         rule: rule.clone(),
-                        checker: index,
+                        rule_id,
+                        checker_id,
                         source: source.clone(),
                         result,
                     })
