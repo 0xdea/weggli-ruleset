@@ -123,6 +123,10 @@ impl RuleSet {
         self.rules.get(index).map(|(_, r)| r.clone())
     }
 
+    pub fn get_ref(&self, index: usize) -> Option<&Rule> {
+        self.rules.get(index).map(|(_, r)| r.as_ref())
+    }
+
     pub fn iter(&self) -> impl ExactSizeIterator<Item = (&str, &Rule)> {
         self.rules.iter().map(|(p, r)| (p.as_str(), r.as_ref()))
     }
