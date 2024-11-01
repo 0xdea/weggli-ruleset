@@ -122,7 +122,7 @@ impl RuleMatcher {
     }
 
     pub fn matches(&mut self, source: impl AsRef<str>) -> Result<Vec<RuleMatch>, RuleMatcherError> {
-        self.matches_with(source, true)
+        self.matches_with(source, false)
     }
 
     pub fn matches_with(
@@ -139,9 +139,9 @@ impl RuleMatcher {
         }
 
         let tree = if is_cxx {
-            self.cxx_parser.parse(source, None)
+            self.cxx_parser.parse(source.as_bytes(), None)
         } else {
-            self.c_parser.parse(source, None)
+            self.c_parser.parse(source.as_bytes(), None)
         };
 
         // parse failed...
@@ -174,6 +174,7 @@ impl RuleMatcher {
 
 #[cfg(test)]
 mod test {
+    use std::fs;
     use super::RuleMatcher;
 
     #[test]
@@ -255,6 +256,24 @@ check-patterns:
         for m in matches {
             println!("\n\n{}", m.display(5, 5, true));
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_decomp_ls() -> Result<(), Box<dyn std::error::Error>> {
+        let rule1 = r#"
+id: call-to-unbounded-copy-functions
+check pattern:
+  pattern: |
+    { strcpy(); }
+"#;
+        let mut matcher = RuleMatcher::from_str(rule1)?;
+        let input = fs::read_to_string("tests/ls-main.c")?;
+
+        let matches = matcher.matches_with(&input, false)?;
+
+        assert_eq!(matches.len(), 1);
 
         Ok(())
     }

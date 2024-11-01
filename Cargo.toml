@@ -1,6 +1,6 @@
 [package]
 name = "weggli-ruleset"
-version = "0.1.4"
+version = "0.1.5"
 authors = ["Sam L. Thomas <s@ghost.sh>"]
 description = "Ruleset managment/matching/reporting for weggli patterns"
 license = "MIT"
