@@ -265,8 +265,10 @@ check-patterns:
         let rule1 = r#"
 id: call-to-unbounded-copy-functions
 check pattern:
+- name: st(r|p)(cpy|cat)
+  regex: func=st(r|p)(cpy|cat)$
   pattern: |
-    { strcpy(); }
+    { $func(); }
 "#;
         let mut matcher = RuleMatcher::from_str(rule1)?;
         let input = fs::read_to_string("tests/ls-main.c")?;
