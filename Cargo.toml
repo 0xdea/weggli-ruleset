@@ -6,6 +6,7 @@ description = "Ruleset managment/matching/reporting for weggli patterns"
 license = "MIT"
 repository = "https://github.com/xorpse/weggli-ruleset.git"
 edition = "2021"
+exclude = ["tests"]
 
 [dependencies]
 anyhow = "1"
