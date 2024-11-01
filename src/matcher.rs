@@ -32,7 +32,7 @@ impl RuleMatch {
     }
 
     pub fn checker_id(&self) -> usize {
-        self.rule_id
+        self.checker_id
     }
 
     pub fn checker(&self) -> &Checker {
