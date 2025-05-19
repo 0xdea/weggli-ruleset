@@ -296,10 +296,10 @@ impl<'de> Deserialize<'de> for Rule {
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
 pub enum CheckerLanguage {
-    #[serde(rename = "c", alias = "C++")]
+    #[serde(rename = "c")]
     #[default]
     C,
-    #[serde(rename = "c++", alias = "C++")]
+    #[serde(rename = "c++")]
     Cplusplus,
 }
 
